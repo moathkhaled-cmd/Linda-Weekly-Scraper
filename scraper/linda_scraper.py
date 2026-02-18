@@ -15,6 +15,8 @@ from urllib.parse import urljoin
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
@@ -88,7 +90,8 @@ def init_driver(worker_id: int = 0) -> webdriver.Chrome:
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
 
-    return webdriver.Chrome(options=opts)
+    service = Service(ChromeDriverManager().install()) if IS_CI else Service()
+    return webdriver.Chrome(service=service, options=opts)
 
 
 # =====================================================================
