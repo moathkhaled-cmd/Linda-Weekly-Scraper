@@ -1,0 +1,165 @@
+============================================================
+  BELHASA SCRAPER — GITHUB ACTIONS CLOUD SETUP GUIDE
+  100% Free | Runs every week | PC can be OFF
+============================================================
+
+WHAT YOU NEED
+─────────────
+- A free GitHub account (github.com)
+- A Gmail account with an App Password
+
+============================================================
+STEP 1 — GET GMAIL APP PASSWORD (one time, 2 minutes)
+============================================================
+
+1. Go to: https://myaccount.google.com/security
+2. Turn ON "2-Step Verification" if not already on
+3. Search "App passwords" at the top of that page
+4. Generate one → App: Mail | Device: Windows Computer
+5. Copy the 16-character code shown (e.g. "abcd efgh ijkl mnop")
+   Keep this — you'll need it in Step 3.
+
+============================================================
+STEP 2 — CREATE A GITHUB REPO
+============================================================
+
+1. Go to https://github.com → Click the "+" top right → "New repository"
+2. Name it: belhasa-scraper
+3. Set to PRIVATE (so your email/data stays private)
+4. Click "Create repository"
+5. Upload these files to the repo (drag & drop in the browser):
+
+   Your repo should look like this:
+   ┌─────────────────────────────────────────────┐
+   │ belhasa-scraper/                            │
+   │   .github/                                  │
+   │     workflows/                              │
+   │       weekly_scrape.yml    ← workflow file  │
+   │   scraper/                                  │
+   │     belhasa_scraper.py     ← the scraper    │
+   └─────────────────────────────────────────────┘
+
+   How to upload:
+   - Click "Add file" → "Upload files"
+   - Upload belhasa_scraper.py into a folder called "scraper/"
+     (type "scraper/" before the filename when prompted)
+   - For the workflow: create the path
+     .github/workflows/weekly_scrape.yml manually using
+     "Create new file" and typing the path
+
+============================================================
+STEP 3 — ADD YOUR EMAIL SECRETS (keeps passwords safe)
+============================================================
+
+Never put passwords directly in code. GitHub Secrets are encrypted.
+
+1. In your repo → Click "Settings" tab
+2. Left sidebar → "Secrets and variables" → "Actions"
+3. Click "New repository secret" — add these 3 secrets:
+
+   Secret 1:
+     Name:  EMAIL_SENDER
+     Value: your_gmail@gmail.com
+
+   Secret 2:
+     Name:  EMAIL_PASSWORD
+     Value: abcd efgh ijkl mnop   (your 16-char App Password)
+
+   Secret 3:
+     Name:  EMAIL_TO
+     Value: you@gmail.com
+     (for multiple recipients: you@gmail.com,boss@gmail.com)
+
+============================================================
+STEP 4 — ADJUST THE SCHEDULE (optional)
+============================================================
+
+Open weekly_scrape.yml and find this line:
+
+    - cron: "0 7 * * 1"
+
+This means: Every Monday at 7:00 AM UTC
+
+UTC is 4 hours behind Dubai time (GST).
+So 7:00 AM UTC = 11:00 AM Dubai time.
+
+To change the day or time, use this format:
+    "MINUTE HOUR * * DAY"
+
+    DAY: 0=Sunday, 1=Monday, 2=Tuesday ... 6=Saturday
+
+Examples:
+    "0 6 * * 0"   = Every Sunday at 10:00 AM Dubai
+    "0 5 * * 3"   = Every Wednesday at 9:00 AM Dubai
+    "0 3 * * 1"   = Every Monday at 7:00 AM Dubai
+
+============================================================
+STEP 5 — TEST IT MANUALLY
+============================================================
+
+1. Go to your repo → Click "Actions" tab
+2. Click "Belhasa Weekly Scraper" on the left
+3. Click "Run workflow" button on the right → "Run workflow"
+4. Watch it run (takes 15-30 minutes for all ads)
+5. Check your email for the CSV
+
+If it fails:
+- Click the failed run → Click the job name
+- Read the error in the logs
+- Most common issue: wrong App Password in secrets
+
+============================================================
+STEP 6 — WHERE TO SEE YOUR FILES
+============================================================
+
+After each run, the CSV is:
+1. Emailed to you automatically
+2. Available in "Actions" → click the run → "Artifacts" section
+   (downloadable for 30 days)
+
+The "Saif Belhasa ad/" folder with all historical CSVs is
+preserved between runs using GitHub's cache system.
+
+============================================================
+COMPARING OPTIONS
+============================================================
+
+                    PC (Task Scheduler)   Cloud (GitHub Actions)
+─────────────────────────────────────────────────────────────────
+Cost                FREE                  FREE
+PC needs to be ON   YES                   NO
+Setup difficulty    Easy                  Medium (one-time)
+Runs if PC off      NO                    YES
+History kept        Yes (local folder)    Yes (cache + artifacts)
+Email report        YES                   YES
+Headless Chrome     NO (visible windows)  YES (automatic)
+─────────────────────────────────────────────────────────────────
+
+RECOMMENDATION:
+  Use GitHub Actions if your PC is often off or you travel.
+  Use Task Scheduler if your PC is always on.
+
+============================================================
+TROUBLESHOOTING
+============================================================
+
+"No module named selenium"
+  → The workflow installs it automatically. If it fails,
+    check the "Install dependencies" step in the run logs.
+
+"Email failed: Authentication error"
+  → Your App Password is wrong. Generate a new one and
+    update the EMAIL_PASSWORD secret.
+
+"0 ads found"
+  → The site may have added more pages.
+    Update PAGES = list(range(0, 8)) in the scraper.
+    Change 8 to a higher number.
+
+"Workflow not running on schedule"
+  → GitHub pauses scheduled workflows if the repo has no
+    activity for 60 days. Just push a small change to wake it up.
+    Or use "Run workflow" manually each week.
+
+============================================================
+EOF
