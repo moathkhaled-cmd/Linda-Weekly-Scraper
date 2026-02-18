@@ -2,21 +2,17 @@ import os
 import re
 import time
 import datetime
-import threading
 import smtplib
 import traceback
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from queue import Queue, Empty
 from urllib.parse import urljoin
 
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
@@ -25,73 +21,64 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 # ================= CONFIG =================
 BASE_URL    = "https://www.lindacars.com"
 START_URL   = "https://www.lindacars.com/buy-car?hotDeals=false&page-size=12&sort-by=id&sort-order=desc&lang=en&page="
-SAVE_DIR    = "Linda Cars ad"     # folder where CSVs are saved
-WAIT_PAGE   = 15                  # seconds to wait for listing page tiles
-WAIT_AD     = 15                  # seconds to wait for ad detail page
-MAX_RETRIES = 3                   # retries per ad
-RETRY_WAIT  = 3                   # seconds between retries
-NUM_WORKERS = 4                   # parallel Chrome windows
+SAVE_DIR    = "Linda Cars ad"
+WAIT_PAGE   = 10    # seconds to wait for listing page
+WAIT_AD     = 5    # seconds to wait for ad detail page (reduced)
+MAX_RETRIES = 2     # retries per ad (reduced from 3)
+RETRY_WAIT  = 2     # seconds between retries (reduced from 3)
 
-# Chrome profile — each worker gets its own subfolder (local PC only)
-# Replace "User" with your actual Windows username
+# Chrome profile — local PC only, ignored on GitHub Actions
 CHROME_PROFILE = r"C:\Users\User\AppData\Local\Google\Chrome\User Data\Selenium_Linda"
 
 # ── EMAIL CONFIG ──────────────────────────────────────────────────────────────
-# On GitHub Actions these are read from repository Secrets automatically.
-# For local use, replace the fallback strings with your real values.
 EMAIL_SENDER   = os.environ.get("EMAIL_SENDER",   "your_gmail@gmail.com")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "xxxx xxxx xxxx xxxx")
 EMAIL_TO_RAW   = os.environ.get("EMAIL_TO",       "your_email@gmail.com")
 EMAIL_TO       = [e.strip() for e in EMAIL_TO_RAW.split(",") if e.strip()]
-EMAIL_ENABLED  = "your_gmail" not in EMAIL_SENDER  # auto-disabled if not configured
+EMAIL_ENABLED  = "your_gmail" not in EMAIL_SENDER
 # ─────────────────────────────────────────────────────────────────────────────
 
-DATE_COL   = "Scraped_Date"
-print_lock = threading.Lock()
-
-# True when running on GitHub Actions (headless mode, no Chrome profile needed)
-IS_CI = os.environ.get("CI", "false").lower() == "true"
+DATE_COL = "Scraped_Date"
+IS_CI    = os.environ.get("CI", "false").lower() == "true"
 
 
-def safe_print(*args, **kwargs):
-    with print_lock:
-        print(*args, **kwargs)
+def log(msg):
+    print(msg, flush=True)
 
 
 # =====================================================================
 # IMAGE URL TRANSFORM
-# fit-288xauto  ->  fit-1324xauto  (full-size version on this platform)
 # =====================================================================
 def transform_image_url(url: str) -> str:
     return re.sub(r'fit-\d+xauto', 'fit-1324xauto', url)
 
 
 # =====================================================================
-# CHROME DRIVER INIT
+# CHROME DRIVER — single instance, reused for all ads
 # =====================================================================
-def init_driver(worker_id: int = 0) -> webdriver.Chrome:
+def init_driver() -> webdriver.Chrome:
     opts = Options()
 
     if IS_CI:
-        # GitHub Actions: headless, no profile
         opts.add_argument("--headless=new")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-gpu")
         opts.add_argument("--window-size=1920,1080")
+        # Performance tuning for single-instance cloud scraping
+        opts.add_argument("--disable-extensions")
+        opts.add_argument("--disable-images")          # skip loading images on listing pages
+        opts.add_argument("--blink-settings=imagesEnabled=false")
+        opts.add_argument("--js-flags=--max-old-space-size=512")
     else:
-        # Local: separate Chrome profile per worker to avoid conflicts
-        profile_dir = f"{CHROME_PROFILE}_worker{worker_id}"
-        opts.add_argument(f"user-data-dir={profile_dir}")
+        opts.add_argument(f"user-data-dir={CHROME_PROFILE}_worker0")
         opts.add_argument("--start-maximized")
-        # opts.add_argument("--headless=new")  # uncomment to hide windows locally
 
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
 
-    service = Service(ChromeDriverManager().install()) if IS_CI else Service()
-    return webdriver.Chrome(service=service, options=opts)
+    return webdriver.Chrome(options=opts)
 
 
 # =====================================================================
@@ -103,41 +90,33 @@ def wait_for_ads_on_page(driver):
             EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.dd-product-tile"))
         )
     except TimeoutException:
-        safe_print("  [!] Timed out waiting for listing page.")
+        log("  [!] Timed out waiting for listing page.")
 
 
 def wait_for_ad_detail(driver) -> bool:
-    """Poll several possible content selectors. Returns True when page is ready."""
-    CANDIDATES = [
-        "span.p-brand",
-        "span.p-name",
-        ".MuiCardContent-root",
-        "data",
-    ]
+    """Returns True as soon as any content selector appears."""
+    CANDIDATES = ["span.p-brand", "span.p-name", ".MuiCardContent-root", "data"]
     deadline = time.time() + WAIT_AD
     while time.time() < deadline:
         for sel in CANDIDATES:
             try:
-                el = driver.find_element(By.CSS_SELECTOR, sel)
-                if el:
-                    time.sleep(0.5)  # let React finish rendering
+                if driver.find_element(By.CSS_SELECTOR, sel):
                     return True
             except Exception:
                 pass
-        time.sleep(0.4)
+        time.sleep(0.3)
     return False
 
 
 # =====================================================================
-# URL COLLECTION — auto-stops when a page returns 0 new ads
+# URL COLLECTION
 # =====================================================================
 def collect_ad_urls(driver) -> list:
     ads, seen = [], set()
     page = 0
-
     while True:
         url = f"{START_URL}{page}"
-        safe_print(f"  Collecting page {page}: {url}")
+        log(f"  Collecting page {page}: {url}")
         driver.get(url)
         wait_for_ads_on_page(driver)
 
@@ -152,12 +131,10 @@ def collect_ad_urls(driver) -> list:
                     ads.append(full)
                     new_count += 1
 
-        safe_print(f"    -> {new_count} new ads on page {page} (total: {len(ads)})")
-
+        log(f"    -> {new_count} new ads on page {page} (total: {len(ads)})")
         if new_count == 0:
-            safe_print(f"  No new ads on page {page} — stopping collection.")
+            log(f"  No new ads on page {page} — stopping.")
             break
-
         page += 1
 
     return ads
@@ -165,58 +142,36 @@ def collect_ad_urls(driver) -> list:
 
 # =====================================================================
 # SPEC READING
-# Confirmed HTML structure (deal-drive platform):
-#
-#   div.mui-1d58shw                          <- one spec row
-#     span.MuiTypography-body2               <- LEFT: label container
-#       div > div > svg + span("Year")       <- label text in last <span>
-#     span.MuiTypography-body1               <- RIGHT: value
-#       "2026"
-#
-# Special rows:
-#   "model"      -> value has <span.p-brand>Make</span><span> ModelSuffix</span>
-#   "body color" -> value has nested span.MuiTypography-body2 with color name
-#   "body type"  -> value has two div.MuiBox-root ("SUV" + "5-doors")
-#   "engine"     -> value is "Petrol 2.0 L (254 hp)" -> split into Fuel + Engine
 # =====================================================================
-
 YEAR_RE    = re.compile(r'^(19[5-9]\d|20[0-3]\d)$')
 MILEAGE_RE = re.compile(r'km', re.IGNORECASE)
+ENGINE_FUEL_RE = re.compile(r'^([A-Za-z][\w\s\-]*?)\s+(\d.*)', re.DOTALL)
 
-# Maps label text (lowercase) from the left side -> CSV column name
 LABEL_MAP = {
-    # car identity
     "trim"                : "Trim",
     "body type"           : "BodyType",
     "body color"          : "Color",
     "colour"              : "Color",
     "color"               : "Color",
-    # mechanical
     "transmission"        : "Transmission",
     "gearbox"             : "Transmission",
     "drive"               : "Drive",
     "fuel type"           : "Fuel",
     "fuel"                : "Fuel",
-    # year / usage
     "year"                : "Year",
     "mileage"             : "Mileage",
     "condition"           : "Condition",
     "seat count"          : "Seats",
-    # history
     "previous owners"     : "Owners",
     "accidents"           : "Accidents",
     "general condition"   : "GeneralCondition",
     "body condition"      : "BodyCondition",
     "mechanical condition": "MechanicalCondition",
     "interior condition"  : "InteriorCondition",
-    # specs
     "regional specs"      : "Specs",
     "emission standard"   : "EmissionStandard",
     "emission co2"        : "EmissionCO2",
 }
-
-# Splits "Petrol 2.0 L (254 hp)" -> ("Petrol", "2.0 L (254 hp)")
-ENGINE_FUEL_RE = re.compile(r'^([A-Za-z][\w\s\-]*?)\s+(\d.*)', re.DOTALL)
 
 
 def safe_get(driver, selector) -> str:
@@ -227,12 +182,10 @@ def safe_get(driver, selector) -> str:
 
 
 def extract_label(row) -> str:
-    """Read the LEFT (label) text from a spec row."""
     try:
         label_el    = row.find_element(By.CSS_SELECTOR, "span.MuiTypography-body2")
         label_spans = label_el.find_elements(By.CSS_SELECTOR, "span")
         if label_spans:
-            # Last <span> is the text label (earlier ones may be SVG wrappers)
             return label_spans[-1].text.strip().lower()
         return label_el.text.strip().lower()
     except Exception:
@@ -240,40 +193,25 @@ def extract_label(row) -> str:
 
 
 def extract_value(row, label: str) -> str:
-    """
-    Read the RIGHT (value) from a spec row.
-    Handles the three special-case layouts confirmed from the HTML.
-    """
     try:
         value_el = row.find_element(By.CSS_SELECTOR, "span.MuiTypography-body1")
-
-        # Body color: text is in a nested span.MuiTypography-body2 (color name beside swatch)
         if label == "body color":
             try:
-                color_span = value_el.find_element(
+                return value_el.find_element(
                     By.CSS_SELECTOR, "span.MuiTypography-body2"
-                )
-                return color_span.text.strip()
+                ).text.strip()
             except Exception:
                 pass
-
-        # Body type: two MuiBox-root divs e.g. "SUV" + "5-doors" -> "SUV 5-doors"
         if label == "body type":
             boxes = value_el.find_elements(By.CSS_SELECTOR, "div.MuiBox-root")
             if boxes:
                 return " ".join(b.text.strip() for b in boxes if b.text.strip())
-
         return value_el.text.strip()
     except Exception:
         return ""
 
 
 def split_fuel_engine(raw: str):
-    """
-    'Petrol 2.0 L (254 hp)'  ->  fuel='Petrol', engine='2.0 L (254 hp)'
-    'Petrol Plug-in Hybrid 2.4 L' -> fuel='Petrol Plug-in Hybrid', engine='2.4 L'
-    Returns ('', raw) if pattern doesn't match.
-    """
     m = ENGINE_FUEL_RE.match(raw.strip())
     if m:
         return m.group(1).strip(), m.group(2).strip()
@@ -281,35 +219,25 @@ def split_fuel_engine(raw: str):
 
 
 def read_all_specs(driver) -> dict:
-    """
-    Walk every spec row and read label (left) + value (right).
-    Returns a dict with CSV column names as keys.
-    Also stores MakeFromRow and ModelSuffix for the combined Model row.
-    """
     specs = {}
-
     try:
         rows = driver.find_elements(By.CSS_SELECTOR, ".MuiCardContent-root .mui-1d58shw")
-
         for row in rows:
             try:
                 label = extract_label(row)
                 if not label:
                     continue
 
-                # ── "Model" row: value = "<p-brand>Jetour</p-brand><span> T2</span>" ──
-                # Pull Make from p-brand span, Model suffix from remaining text
                 if label == "model":
                     try:
                         value_el  = row.find_element(By.CSS_SELECTOR, "span.MuiTypography-body1")
                         make_span = value_el.find_element(By.CSS_SELECTOR, "span.p-brand")
                         make_text = make_span.text.strip()
                         full_text  = value_el.text.strip()
-                        model_text = full_text.replace(make_text, "").strip()
                         if make_text and "MakeFromRow" not in specs:
                             specs["MakeFromRow"] = make_text
-                        if model_text and "ModelSuffix" not in specs:
-                            specs["ModelSuffix"] = model_text
+                        if "ModelSuffix" not in specs:
+                            specs["ModelSuffix"] = full_text.replace(make_text, "").strip()
                     except Exception:
                         pass
                     continue
@@ -318,7 +246,6 @@ def read_all_specs(driver) -> dict:
                 if not value:
                     continue
 
-                # ── "Engine" row: "Petrol 2.0 L (254 hp)" -> Fuel + Engine ──
                 if label == "engine":
                     fuel, engine_size = split_fuel_engine(value)
                     if fuel and "Fuel" not in specs:
@@ -330,20 +257,15 @@ def read_all_specs(driver) -> dict:
                 col = LABEL_MAP.get(label)
                 if col and col not in specs:
                     specs[col] = value
-
             except Exception:
                 continue
-
     except Exception:
         pass
 
-    # ── Fallback: pattern scan for Year & Mileage if label-based read missed them ──
+    # Fallback for Year & Mileage
     if "Year" not in specs or "Mileage" not in specs:
         try:
-            all_body1 = driver.find_elements(
-                By.CSS_SELECTOR, ".MuiCardContent-root span.MuiTypography-body1"
-            )
-            for span in all_body1:
+            for span in driver.find_elements(By.CSS_SELECTOR, ".MuiCardContent-root span.MuiTypography-body1"):
                 try:
                     text = span.text.strip()
                     if not text:
@@ -361,11 +283,9 @@ def read_all_specs(driver) -> dict:
 
 
 def read_images(driver) -> str:
-    """Collect all deal-drive images, upgrade to fit-1324xauto, deduplicate."""
     images, seen_hashes = [], set()
     try:
-        img_elements = driver.find_elements(By.CSS_SELECTOR, ".MuiStack-root img")
-        for img in img_elements:
+        for img in driver.find_elements(By.CSS_SELECTOR, ".MuiStack-root img"):
             try:
                 src = img.get_attribute("src") or img.get_attribute("data-src") or ""
                 if not src or "content.deal-drive.com" not in src:
@@ -384,7 +304,7 @@ def read_images(driver) -> str:
 
 
 # =====================================================================
-# SCRAPE SINGLE AD  (with retry)
+# SCRAPE SINGLE AD
 # =====================================================================
 def scrape_ad_details(driver, ad_url: str) -> dict:
     data = {"ad_url": ad_url}
@@ -395,16 +315,12 @@ def scrape_ad_details(driver, ad_url: str) -> dict:
             if not wait_for_ad_detail(driver):
                 raise TimeoutException(f"Page not ready after {WAIT_AD}s")
 
-            # Read all specs first — the "model" row gives us Make + Model
             specs  = read_all_specs(driver)
             images = read_images(driver)
 
-            # Make: p-brand span on page (most reliable), fallback to spec row
             make = safe_get(driver, "span.p-brand") or specs.get("MakeFromRow", "")
-
-            # Model: p-name span if present, otherwise combine MakeFromRow + ModelSuffix
             model_suffix = specs.get("ModelSuffix", "")
-            p_name       = safe_get(driver, "span.p-name")
+            p_name = safe_get(driver, "span.p-name")
             if p_name:
                 model = p_name
             elif make and model_suffix:
@@ -412,7 +328,6 @@ def scrape_ad_details(driver, ad_url: str) -> dict:
             else:
                 model = model_suffix or make
 
-            # Price from <data> tag
             price = ""
             try:
                 el    = driver.find_element(By.CSS_SELECTOR, "data")
@@ -421,7 +336,7 @@ def scrape_ad_details(driver, ad_url: str) -> dict:
                 pass
 
             if not make and not model and not price:
-                raise ValueError("All core fields empty — page likely not loaded yet")
+                raise ValueError("All core fields empty")
 
             data.update({
                 "Make"               : make,
@@ -450,22 +365,15 @@ def scrape_ad_details(driver, ad_url: str) -> dict:
                 "Images"             : images,
             })
 
-            safe_print(
-                f"    [OK] {make} {model} | {price} | "
-                f"Y:{data['Year']} | KM:{data['Mileage']} | "
-                f"Fuel:{data['Fuel']} | Eng:{data['Engine']} | "
-                f"Trans:{data['Transmission']} | Trim:{data['Trim']} | "
-                f"Color:{data['Color']}"
-            )
+            log(f"    [OK] {make} {model} | {price} | Y:{data['Year']} | KM:{data['Mileage']} | Fuel:{data['Fuel']} | Color:{data['Color']}")
             return data
 
         except Exception as e:
-            safe_print(f"  [!] Attempt {attempt}/{MAX_RETRIES} — {ad_url} -> {e}")
+            log(f"  [!] Attempt {attempt}/{MAX_RETRIES} — {ad_url} -> {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_WAIT)
 
-    # All retries failed — save URL with empty fields so nothing is lost
-    safe_print(f"  [✗] FAILED after {MAX_RETRIES} attempts: {ad_url}")
+    log(f"  [✗] FAILED: {ad_url}")
     data.update({
         "Make": "", "Model": "", "Description": "", "Price": "",
         "Color": "", "Year": "", "Mileage": "", "Fuel": "",
@@ -479,32 +387,6 @@ def scrape_ad_details(driver, ad_url: str) -> dict:
 
 
 # =====================================================================
-# WORKER THREAD
-# =====================================================================
-def worker_scrape(worker_id: int, url_queue: Queue, results: list, counter: list, total: int):
-    driver = init_driver(worker_id)
-    safe_print(f"  [Worker {worker_id}] Browser ready.")
-    try:
-        while True:
-            try:
-                ad_url = url_queue.get_nowait()
-            except Empty:
-                break
-
-            with print_lock:
-                counter[0] += 1
-                idx = counter[0]
-
-            safe_print(f"  [W{worker_id}] [{idx}/{total}] {ad_url}")
-            result = scrape_ad_details(driver, ad_url)
-            results.append(result)
-            url_queue.task_done()
-    finally:
-        driver.quit()
-        safe_print(f"  [Worker {worker_id}] Done & closed.")
-
-
-# =====================================================================
 # RECONCILER
 # =====================================================================
 def get_csv_path(today: str) -> str:
@@ -515,16 +397,12 @@ def get_csv_path(today: str) -> str:
 def find_latest_csv(exclude_date: str = ""):
     if not os.path.isdir(SAVE_DIR):
         return None
-    csvs = []
-    for f in os.listdir(SAVE_DIR):
-        if f.endswith(".csv"):
-            name = f[:-4]
-            if name != exclude_date:
-                csvs.append((name, os.path.join(SAVE_DIR, f)))
+    csvs = [(f[:-4], os.path.join(SAVE_DIR, f))
+            for f in os.listdir(SAVE_DIR)
+            if f.endswith(".csv") and f[:-4] != exclude_date]
     if not csvs:
         return None
-    csvs.sort(key=lambda x: x[0], reverse=True)
-    return csvs[0][1]
+    return sorted(csvs, key=lambda x: x[0], reverse=True)[0][1]
 
 
 def reconcile(new_df: pd.DataFrame, today: str) -> pd.DataFrame:
@@ -533,7 +411,7 @@ def reconcile(new_df: pd.DataFrame, today: str) -> pd.DataFrame:
 
     prev_path = find_latest_csv(exclude_date=today)
     if prev_path is None:
-        print(f"  No previous data — marking all {len(new_df)} ads as NEW.")
+        log(f"  No previous data — marking all {len(new_df)} ads as NEW.")
         new_df["Status"]         = "NEW"
         new_df["Change_Details"] = ""
         new_df["Prev_Price"]     = ""
@@ -543,16 +421,14 @@ def reconcile(new_df: pd.DataFrame, today: str) -> pd.DataFrame:
     try:
         prev_df = pd.read_csv(prev_path, dtype=str).fillna("")
     except Exception as e:
-        print(f"  Could not read previous file ({e}) — marking all as NEW.")
+        log(f"  Could not read previous file ({e}) — marking all as NEW.")
         new_df["Status"]         = "NEW"
         new_df["Change_Details"] = ""
         new_df["Prev_Price"]     = ""
         new_df["Prev_Mileage"]   = ""
         return new_df
 
-    print(f"  Comparing against: {prev_path}  ({len(prev_df)} rows)")
-
-    # Only non-REMOVED rows from last run are the active baseline
+    log(f"  Comparing against: {prev_path}  ({len(prev_df)} rows)")
     active_prev = prev_df[prev_df["Status"].str.upper() != "REMOVED"].set_index("ad_url")
 
     new_df.set_index("ad_url", inplace=True)
@@ -567,7 +443,6 @@ def reconcile(new_df: pd.DataFrame, today: str) -> pd.DataFrame:
             old_mileage = active_prev.at[url, "Mileage"] if "Mileage" in active_prev.columns else ""
             new_price   = str(new_df.at[url, "Price"])
             new_mileage = str(new_df.at[url, "Mileage"])
-
             price_changed   = old_price   != new_price
             mileage_changed = old_mileage != new_mileage
 
@@ -584,7 +459,6 @@ def reconcile(new_df: pd.DataFrame, today: str) -> pd.DataFrame:
                 new_df.at[url, "Prev_Price"]     = old_price
                 new_df.at[url, "Prev_Mileage"]   = old_mileage
 
-    # Ads that vanished since last run -> REMOVED
     removed_urls = active_prev.index.difference(new_df.index)
     if len(removed_urls):
         removed                   = active_prev.loc[removed_urls].copy()
@@ -618,9 +492,8 @@ def print_reconcile_summary(df: pd.DataFrame):
 # =====================================================================
 def send_email(csv_path: str, summary: dict, today: str):
     if not EMAIL_ENABLED:
-        print("  Email disabled (EMAIL_SENDER not configured) — skipping.")
+        log("  Email disabled — skipping.")
         return
-
     try:
         msg            = MIMEMultipart()
         msg["From"]    = EMAIL_SENDER
@@ -628,17 +501,14 @@ def send_email(csv_path: str, summary: dict, today: str):
         msg["Subject"] = f"Linda Cars — Weekly Scrape {today}"
 
         body_lines = [
-            f"Linda Cars scrape completed on {today}.",
-            "",
+            f"Linda Cars scrape completed on {today}.", "",
             "Summary:",
             f"  NEW        : {summary.get('NEW', 0)}",
             f"  UPDATED    : {summary.get('UPDATED', 0)}",
             f"  UNCHANGED  : {summary.get('UNCHANGED', 0)}",
             f"  REMOVED    : {summary.get('REMOVED', 0)}",
-            f"  TOTAL ROWS : {summary.get('TOTAL', 0)}",
-            "",
-            "The full CSV is attached.",
-            "",
+            f"  TOTAL ROWS : {summary.get('TOTAL', 0)}", "",
+            "The full CSV is attached.", "",
             "— Linda Cars Scraper (automated)",
         ]
         msg.attach(MIMEText("\n".join(body_lines), "plain"))
@@ -647,88 +517,65 @@ def send_email(csv_path: str, summary: dict, today: str):
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
         encoders.encode_base64(part)
-        part.add_header(
-            "Content-Disposition",
-            f'attachment; filename="{os.path.basename(csv_path)}"'
-        )
+        part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(csv_path)}"')
         msg.attach(part)
 
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
             server.sendmail(EMAIL_SENDER, EMAIL_TO, msg.as_string())
 
-        print(f"  Email sent to: {', '.join(EMAIL_TO)}")
-
+        log(f"  Email sent to: {', '.join(EMAIL_TO)}")
     except Exception as e:
-        print(f"  [!] Email failed: {e}")
+        log(f"  [!] Email failed: {e}")
         traceback.print_exc()
 
 
 # =====================================================================
-# MAIN
+# MAIN — single Chrome instance, sequential scraping
 # =====================================================================
 def main():
     today    = datetime.date.today().isoformat()
     csv_path = get_csv_path(today)
 
-    # Phase 1: collect all ad URLs (stops automatically when no new ads found)
-    print("=== PHASE 1: Collecting ad URLs ===")
-    collector = init_driver(worker_id=99)
-    try:
-        ad_urls = collect_ad_urls(collector)
-    finally:
-        collector.quit()
-
-    total = len(ad_urls)
-    print(f"\n  Total ads found: {total}")
-
-    if total == 0:
-        print("  No ads found — aborting.")
-        return
-
-    # Phase 2: parallel scrape with NUM_WORKERS Chrome windows
-    print(f"\n=== PHASE 2: Scraping {total} ads with {NUM_WORKERS} parallel windows ===")
-
-    url_queue = Queue()
-    for url in ad_urls:
-        url_queue.put(url)
-
+    driver = init_driver()
     results = []
-    counter = [0]
-    threads = []
 
-    for wid in range(NUM_WORKERS):
-        t = threading.Thread(
-            target=worker_scrape,
-            args=(wid, url_queue, results, counter, total),
-            daemon=True,
-            name=f"Worker-{wid}",
-        )
-        t.start()
-        threads.append(t)
-        time.sleep(2)  # stagger starts to avoid Chrome race condition
+    try:
+        # Phase 1: collect all URLs
+        log("=== PHASE 1: Collecting ad URLs ===")
+        ad_urls = collect_ad_urls(driver)
+        total   = len(ad_urls)
+        log(f"\n  Total ads found: {total}")
 
-    for t in threads:
-        t.join()
+        if total == 0:
+            log("  No ads found — aborting.")
+            return
 
-    # Phase 3: reconcile with previous run and save CSV
-    print("\n=== PHASE 3: Reconciling & Saving ===")
+        # Phase 2: scrape all ads with the same browser instance (no restart overhead)
+        log(f"\n=== PHASE 2: Scraping {total} ads ===")
+        for idx, ad_url in enumerate(ad_urls, 1):
+            log(f"  [{idx}/{total}] {ad_url}")
+            results.append(scrape_ad_details(driver, ad_url))
+
+    finally:
+        driver.quit()
+
+    # Phase 3: reconcile & save
+    log("\n=== PHASE 3: Reconciling & Saving ===")
     raw_df   = pd.DataFrame(results)
     final_df = reconcile(raw_df, today)
-
     os.makedirs(SAVE_DIR, exist_ok=True)
     final_df.to_csv(csv_path, index=False)
-
     print_reconcile_summary(final_df)
-    print(f"\n  Saved -> {csv_path}  ({len(final_df)} total rows)")
+    log(f"\n  Saved -> {csv_path}  ({len(final_df)} total rows)")
 
-    # Phase 4: email the CSV
-    print("\n=== PHASE 4: Sending Email ===")
+    # Phase 4: email
+    log("\n=== PHASE 4: Sending Email ===")
     counts = final_df["Status"].value_counts().to_dict() if "Status" in final_df.columns else {}
     counts["TOTAL"] = len(final_df)
     send_email(csv_path, counts, today)
 
-    print("\nDone.")
+    log("\nDone.")
 
 
 if __name__ == "__main__":
